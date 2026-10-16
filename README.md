@@ -1,24 +1,116 @@
 # 💣 BlastRadius
 
-AI-assisted **regression test selection** for Python repositories.
+An AI-assisted **regression test selection** tool for Python repositories.
 
-BlastRadius compares two Git revisions, combines dependency evidence with a
-Gemma model, selects tests deterministically, and
+BlastRadius compares two Git revisions, combines dependency evidence with
+Gemma's semantic impact analysis, selects tests deterministically, and
 executes the selected tests.
-suite.
 
-## Current workflow
+> Given this change, which tests should run first to catch a regression?
 
-```text
-base revision → patch analysis → dependency graph → model risks
-             → deterministic test selection → selected pytest run
-                                      └──────→ optional full-suite comparison
+Gemma reads the patch, changed code, dependency context, and existing test
+catalog, then infers behavioral risks and maps them to tests that may regress.
+BlastRadius uses those relationships to select and run the relevant tests.
+
+## But how does it evaluate with real code?
+
+The controlled banking benchmark was run five times per scenario with Gemma 4 26B,
+pytest, and the benchmark's own Python environment:
+
+| Scenario | Avg selected tests | Avg selected time | Avg full time | Avg reduction | Detected |
+|---|---:|---:|---:|---:|---:|
+| A — boundary | 10.8 / 22 | 0.237s | 0.510s | 53.3% | 5 / 5 |
+| B — fee exemption | 13.0 / 22 | 0.233s | 0.507s | 53.7% | 5 / 5 |
+| C — transaction state | 8.4 / 22 | 0.298s | 0.540s | 45.7% | 5 / 5 |
+
+These results are controlled research evidence, not a guarantee of complete
+regression detection. The full machine-readable runs are in the
+[banking-benchmark-blastradius repository](https://gitlab.com/watetaks/banking-benchmark-blastradius).
+
+## How it works
+
+<p align="center">
+  <img src="assets/blastradius.png" alt="BlastRadius regression test selection flow" width="560">
+</p>
+
+## Gemma as a semantic impact engine
+
+File names and direct dependency edges are not enough for regression selection. For example,
+A one-character change in a balance condition can affect behavior across
+several modules without producing an obvious test dependency.
+
+Gemma can identify that a changed `Account.withdraw` boundary matters to an
+exact-balance payment test even when the test lives in another module. This
+risk-to-test mapping directly drives which tests BlastRadius considers relevant.
+
+BlastRadius deliberately keeps safety-critical behavior outside the model,
+for example, AST analysis for building dependency evidence, validation of model
+output, and conservative full-suite fallback in case of unknown dependencies.
+
+This makes the model useful without making it the source of truth for what
+gets executed.
+
+## What can fail
+
+The model may miss a relevant test, vary between runs, or describe a risk too
+broadly. Static discovery can miss dynamic dispatch, framework-generated
+routes, and unusual Python patterns. In those cases BlastRadius may select
+too many tests or fall back to the full suite.
+
+## Try the benchmark
+
+The most reproducible demo uses the companion benchmark repository:
+
+```bash
+git clone https://gitlab.com/watetaks/blastradius.git
+git clone https://gitlab.com/watetaks/banking-benchmark-blastradius.git
+
+cd blastradius
+uv sync
+
+cd ../banking-benchmark-blastradius
+uv sync --all-groups
+cp ../blastradius/.env.example .env
+git switch eval/scenario-a
+export BLASTRADIUS_PYTHON="$PWD/.venv/bin/python"
+BASE=2f68767
+TARGET=021924b
+PYTHONPATH=../blastradius/src \
+  ../blastradius/.venv/bin/blastradius run \
+  --repo . --base "$BASE" --target "$TARGET" \
+  --python "$BLASTRADIUS_PYTHON" --compare
 ```
 
-BlastRadius is a tool for another repository. The target repository owns the
-application code, tests, Python environment, and Git history.
+This is a Scenario A output from the benchmark repository:
 
-## Install locally
+```text
+Changed: 1 files (+1/-1)
+Graph: 78 nodes, 90 edges
+Risks: 1
+Selected: 10/22 tests
+    tests/test_account.py::test_withdraw_reduces_balance
+    tests/test_payment.py::test_exempt_payment_only_moves_amount
+    tests/test_payment.py::test_payment_moves_amount_and_fee
+    tests/test_payment.py::test_payment_rejects_amount_plus_fee_over_balance
+    tests/test_payment.py::test_payment_rejects_non_positive_amount
+    tests/test_transactions.py::test_completed_transaction_can_be_refunded
+    tests/test_transactions.py::test_completed_transaction_cannot_be_cancelled
+    tests/test_transactions.py::test_exempt_transaction_has_zero_fee
+    tests/test_transactions.py::test_transaction_cannot_process_twice
+    tests/test_transactions.py::test_transaction_processes_payment
+Full-suite fallback: False
+Selected run: FAIL
+```
+
+The exact selected count can vary between runs because Gemma is probabilistic;
+the result above is one recorded run. The benchmark's five-run averages are
+reported above.
+
+Use the scenario branches listed in the benchmark README to reproduce A, B,
+or C. For CI, install BlastRadius as a CLI and use the same command with the
+merge-base of the pull request.
+
+## Setup
 
 From the BlastRadius repository:
 
@@ -34,8 +126,8 @@ uv tool install --editable /absolute/path/to/blastradius
 blastradius --help
 ```
 
-Install target dependencies and point BlastRadius at target repository's
-Python environment:
+When analyzing another repository, install its dependencies and point
+BlastRadius at that repository's Python environment:
 
 ```bash
 cd /absolute/path/to/benchmark
@@ -45,7 +137,7 @@ export BLASTRADIUS_PYTHON="$PWD/.venv/bin/python"
 
 ## Configuration
 
-BlastRadius requires a Gemma model. The model can run locally or through a
+BlastRadius requires an AI model. The model can run locally or through a
 hosted provider such as Ollama, OpenRouter, DigitalOcean, or another service
 that exposes the required chat API.
 
@@ -57,8 +149,9 @@ export BLASTRADIUS_MODEL="gemma-local"
 export BLASTRADIUS_API_KEY=""
 ```
 
-For local use, place these values in the target repository's `.env`. The file
-is loaded automatically and must not be committed. Copy the example first:
+Place these values in the target repository's `.env`, the repository being
+analyzed, not the BlastRadius repository. The file is loaded automatically and
+must not be committed. Copy the example first:
 
 ```bash
 cp /absolute/path/to/blastradius/.env.example .env
@@ -72,9 +165,7 @@ export BLASTRADIUS_MODEL="google/gemma-3-27b-it"
 export BLASTRADIUS_API_KEY="your-key"
 ```
 
-The endpoint must expose `/chat/completions`.
-
-## Local usage
+## Analyze a commit or pull request
 
 The target must have the desired target revision checked out. The base and
 target must be real Git revisions, not placeholder names.
@@ -124,26 +215,8 @@ blastradius run \
   --compare
 ```
 
-## External banking benchmark
-
-The benchmark is a separate repository, not a BlastRadius subdirectory:
-
-```bash
-cd /absolute/path/to/benchmark
-uv sync --all-groups
-
-BASE=$(git rev-parse HEAD^)
-TARGET=$(git rev-parse HEAD)
-
-blastradius run \
-  --repo . \
-  --base "$BASE" \
-  --target "$TARGET" \
-  --python .venv/bin/python
-```
-
-The benchmark has 22 tests, a FastAPI transaction surface, and optional test
-cost simulation:
+The companion benchmark is a separate repository with 22 tests, a FastAPI
+transaction surface, and optional test-cost simulation:
 
 ```bash
 BENCHMARK_TEST_DELAY=0.05 uv run pytest
@@ -154,8 +227,8 @@ normal development.
 
 ## Test patches and evaluation
 
-For a normal PR that does not modify tests, no test-patch step is needed.
-Existing target tests form the catalog.
+For a normal PR, no test-patch step is needed. Existing target tests form the
+catalog, even when the PR does not modify them.
 
 For controlled evaluation, keep application and test changes separate:
 
@@ -231,7 +304,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
-      - run: uv tool install blastradius
+      - run: uv tool install "git+https://gitlab.com/watetaks/blastradius.git"
       - run: uv sync
       - name: Run BlastRadius
         env:
